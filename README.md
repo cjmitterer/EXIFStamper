@@ -2,7 +2,7 @@
 
 # DISCLAIMER:
 
-This was created as a tool was created using extensive use of generative AI and honestly kind of sucks. But..... it does what I need to do with it. I may clean it up but likely will be abandonded. If I ever make this public and someone for somereason wants to use it hats off to you.
+This was created using extensive use of generative AI and honestly kind of sucks. But..... it does what I need to do with it. I may clean it up but likely will be abandonded. If I ever make this public and someone for somereason wants to use it hats off to you.
 
 # Purpose
 
