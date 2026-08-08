@@ -2,3 +2,10 @@ _bmad/
 _bmad-output/
 __pycache__/
 .agents/
+.github
+.venv/
+.vscode/
+docs/
+
+# Log File:
+stamper.log
