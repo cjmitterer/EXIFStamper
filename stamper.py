@@ -428,6 +428,30 @@ class VideoAtomHandler:
     DAY_ATOM = "\xa9day"
 
     def read_protection_facts(self, path: Path) -> ProtectionFacts:
+        # MOV and MP4/M4V use different metadata tags; handle separately
+        ext = path.suffix.lower()
+        
+        if ext == ".mov":
+            # MOV files: read CreateDate tag written by exiftool
+            try:
+                result = subprocess.run(
+                    [EXIFTOOL_PATH, "-CreateDate", "-s", "-s", "-s", str(path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    text=True,
+                )
+                create_date = result.stdout.strip() if result.stdout else None
+                return ProtectionFacts(
+                    datetime_original=None,
+                    create_date=create_date,
+                    container_creation_time=None,
+                )
+            except Exception:
+                # If exiftool fails or times out, treat as unprotected (safe default)
+                return ProtectionFacts(datetime_original=None, create_date=None)
+        
+        # MP4/M4V files: read ©day atom via mutagen
         try:
             mp4 = MP4(str(path))
         except MP4StreamInfoError as exc:
@@ -452,8 +476,12 @@ class VideoAtomHandler:
         ext = path.suffix.lower()
         
         if ext == ".mov":
-            # MOV files: use exiftool (required)
-            creation_time = plan_fields["ContainerCreationTime"]
+            # MOV files: use exiftool to write CreateDate
+            # Note: plan_fields["ContainerCreationTime"] is YYYY-MM-DD;
+            # convert to exiftool format YYYY:MM:DD HH:MM:SS (with time 00:00:00)
+            container_creation_date = plan_fields["ContainerCreationTime"]
+            # Convert YYYY-MM-DD to YYYY:MM:DD 00:00:00
+            exiftool_date_format = container_creation_date.replace("-", ":") + " 00:00:00"
             
             try:
                 # exiftool writes in-place and preserves original
@@ -461,7 +489,7 @@ class VideoAtomHandler:
                     [
                         EXIFTOOL_PATH,
                         "-overwrite_original",
-                        f"-CreationTime={creation_time}",
+                        f"-CreateDate={exiftool_date_format}",
                         str(path),
                     ],
                     stdout=subprocess.DEVNULL,
