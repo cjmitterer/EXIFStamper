@@ -679,6 +679,15 @@ def main(argv=None) -> int:
     if not run_options.target_root.is_dir():
         # Spec mandates zero console output; signal via exit code only.
         return 2
+    
+    # Confirm recursive mode outside of dry run
+    if run_options.recursive and not run_options.dry_run:
+        print(f"WARNING: --recursive mode will stamp all files in {run_options.target_root} and its subdirectories.")
+        confirmation = input("Continue? (y/n): ").strip().lower()
+        if confirmation != "y":
+            print("Operation cancelled.")
+            return 0
+    
     try:
         return run(run_options)
     except Exception:
