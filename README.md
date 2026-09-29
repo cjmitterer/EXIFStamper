@@ -2,11 +2,11 @@
 
 # DISCLAIMER:
 
-This was created using extensive use of generative AI and honestly kind of sucks. But..... it does what I need to do with it. I may clean it up but likely will be abandonded. If I ever make this public and someone for somereason wants to use it hats off to you.
+This was created using extensive use of AI coding tools and honestly kind of sucks. But..... it does what I need to do with it so its fine! I may clean it up but likely will be abandoned. If I ever make this public and someone for some reason wants to use it hats off to you.
 
 # Purpose
 
-The purpose of this is to stamp missing timestamps into photo and video files so the original date survives even when copied between devices. I'm currently working on a personal project that requires me to add windows creation data to the meta data of images and videos. Some of those images/videos did not have such data so I am stamping it in pulling from the Windows information.
+The purpose of this is to stamp missing timestamps into photo and video files so the original date survives even when copied between devices. I'm currently working on a personal project that requires me to add windows creation data to the meta data of images and videos. Some of those images/videos did not have such data so I am stamping it in pulling from the Windows information. I have done absolutely zero testing on Mac and Linux system, meaning it will 100% not work there. 
 
 Windows CLI. Single script: `stamper.py`.
 
@@ -73,7 +73,7 @@ python stamper.py <directory> [--recursive] [--dry-run] [--backup]
 
 ## Key behaviors
 
-- **Never overwrites existing dates** — only fills in missing timestamps
-- **Never modifies camera hardware fields** — aperture, ISO, shutter speed, focal length, lens
-- **RAW/DNG files are inspect-only** — never written to
-- **Each run overwrites `stamper.log`** — keep a copy if you need a history
+- **Never overwrites existing dates** only fills in missing timestamps
+- **Never modifies camera hardware fields** aperture, ISO, shutter speed, focal length, lens
+- **RAW/DNG files are inspect-only** never written to
+- **Each run overwrites `stamper.log`** keep a copy if you need a history
