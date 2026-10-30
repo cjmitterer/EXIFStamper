@@ -635,6 +635,8 @@ def run(run_options: RunOptions) -> int:
     machine_identity = resolve_machine_identity()
     log_path = SCRIPT_DIR / LOG_FILENAME
     error_count = 0
+    stamped_count = 0
+    skipped_count = 0
 
     with open(log_path, "w", encoding="utf-8") as log_file:
         for path in scan(run_options):
@@ -643,11 +645,17 @@ def run(run_options: RunOptions) -> int:
                 if file_plan.disposition == "stamp" and not run_options.dry_run:
                     apply(file_plan, run_options)
                 log_file.write(_log_line(run_options, path, file_plan.disposition, file_plan.log_detail) + "\n")
+                if file_plan.disposition == "stamp":
+                    stamped_count += 1
+                else:
+                    skipped_count += 1
             except Exception as exc:  # AD-4: the ONLY per-file catch site
                 error_count += 1
                 reason = f"{type(exc).__name__}: {exc}"
                 log_file.write(_log_line(run_options, path, "error", reason) + "\n")
 
+    stamp_label = "[DRY RUN] Would stamp" if run_options.dry_run else "Stamped"
+    print(f"{stamp_label}: {stamped_count} | Skipped: {skipped_count} | Errors: {error_count}")
     return 1 if error_count else 0
 
 

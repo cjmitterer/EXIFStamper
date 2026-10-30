@@ -15,9 +15,11 @@ Windows CLI. Single script: `stamper.py`.
 1. Scans a directory for media files
 2. Checks if each file already has a timestamp — if it does, leaves it **completely untouched**
 3. For unprotected files, stamps them with `min(creation time, modified time)` 
-4. Logs results to `stamper.log` (no console output)
+4. Logs results to `stamper.log` and prints stamped, skipped, and error totals when finished
 
 Stamped metadata includes: date, time, timezone, device info (Make/Model), and software name.
+
+Skipped totals include protected, detect-only, and unsupported files. Errors are counted separately. Dry runs report "Would stamp" instead of "Stamped".
 
 ## Supported formats
 

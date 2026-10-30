@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 import piexif
@@ -109,6 +110,49 @@ class StamperPipelineTests(unittest.TestCase):
         base = dict(target_root=self.tmpdir, recursive=False, dry_run=False, backup=False)
         base.update(overrides)
         return stamper.RunOptions(**base)
+
+    def test_completion_summary_counts_mixed_outcomes(self):
+        _make_png(self.tmpdir / "stamp.png")
+        _make_jpeg(self.tmpdir / "protected.jpg", with_exif_datetime="2020:01:02 03:04:05")
+        (self.tmpdir / "raw.CR2").write_bytes(b"raw")
+        (self.tmpdir / "notes.txt").write_text("hello")
+        (self.tmpdir / "corrupt.jpg").write_bytes(b"not a jpeg")
+
+        with patch("builtins.print") as output:
+            rc = stamper.run(self._run_options())
+
+        self.assertEqual(rc, 1)
+        output.assert_called_once_with("Stamped: 1 | Skipped: 3 | Errors: 1")
+
+    def test_completion_summary_dry_run_counts_planned_stamps(self):
+        png = self.tmpdir / "stamp.png"
+        _make_png(png)
+        before = png.read_bytes()
+        (self.tmpdir / "notes.txt").write_text("hello")
+
+        with patch("builtins.print") as output:
+            rc = stamper.run(self._run_options(dry_run=True))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(png.read_bytes(), before)
+        output.assert_called_once_with("[DRY RUN] Would stamp: 1 | Skipped: 1 | Errors: 0")
+
+    def test_completion_summary_empty_directory(self):
+        with patch("builtins.print") as output:
+            rc = stamper.run(self._run_options())
+
+        self.assertEqual(rc, 0)
+        output.assert_called_once_with("Stamped: 0 | Skipped: 0 | Errors: 0")
+
+    def test_completion_summary_does_not_count_failed_write_as_stamped(self):
+        _make_png(self.tmpdir / "stamp.png")
+
+        with patch("stamper.apply", side_effect=RuntimeError("write failed")):
+            with patch("builtins.print") as output:
+                rc = stamper.run(self._run_options())
+
+        self.assertEqual(rc, 1)
+        output.assert_called_once_with("Stamped: 0 | Skipped: 0 | Errors: 1")
 
     def test_protected_jpeg_is_never_touched(self):
         jpg = self.tmpdir / "protected.jpg"
