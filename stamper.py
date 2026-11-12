@@ -22,9 +22,12 @@ import shutil
 import socket
 import subprocess
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Literal, Optional
 
 import piexif
@@ -157,10 +160,19 @@ BACKUP_SUFFIX = ".original"
 
 
 @dataclass(frozen=True)
+class ImageLayoutFacts:
+    width: int
+    height: int
+    x_resolution: float
+    y_resolution: float
+
+
+@dataclass(frozen=True)
 class ProtectionFacts:
     datetime_original: Optional[str]
     create_date: Optional[str]
     container_creation_time: Optional[str] = None
+    image_layout: Optional[ImageLayoutFacts] = None
 
 
 @dataclass(frozen=True)
@@ -217,15 +229,25 @@ def _read_exif_facts(path: Path, raise_on_unreadable: bool = False) -> Protectio
     of readability (I/O matrix row) and apply() is never called for them.
     """
     opened = False
+    image_layout = None
     try:
         with Image.open(path) as img:
             opened = True
+            try:
+                width, height = img.size
+                xres = yres = 72
+                dpi = img.info.get("dpi")
+                if dpi:
+                    xres, yres = dpi
+                image_layout = ImageLayoutFacts(width, height, xres, yres)
+            except Exception:
+                pass
             exif = img.getexif()
             exif_ifd = exif.get_ifd(IFD.Exif) if exif else {}
             dto = _decode_exif_str(exif_ifd.get(36867))
             cd = _decode_exif_str(exif_ifd.get(36868))
             if dto or cd:
-                return ProtectionFacts(datetime_original=dto, create_date=cd)
+                return ProtectionFacts(datetime_original=dto, create_date=cd, image_layout=image_layout)
     except Exception:
         pass
     try:
@@ -233,12 +255,12 @@ def _read_exif_facts(path: Path, raise_on_unreadable: bool = False) -> Protectio
         opened = True
         dto = _decode_exif_str(exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal))
         cd = _decode_exif_str(exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeDigitized))
-        return ProtectionFacts(datetime_original=dto, create_date=cd)
+        return ProtectionFacts(datetime_original=dto, create_date=cd, image_layout=image_layout)
     except Exception:
         pass
     if not opened and raise_on_unreadable:
         raise RuntimeError(f"unreadable/corrupt file, cannot verify protection state: {path}")
-    return ProtectionFacts(datetime_original=None, create_date=None)
+    return ProtectionFacts(datetime_original=None, create_date=None, image_layout=image_layout)
 
 
 def _format_utc_offset(for_dt: datetime.datetime) -> str:
@@ -340,6 +362,7 @@ class ImageExifHandler:
         path: Path,
         normalized_dt: Optional[datetime.datetime],
         machine_identity: MachineIdentity,
+        image_layout: Optional[ImageLayoutFacts] = None,
     ) -> Dict[str, Any]:
         assert normalized_dt is not None
         dt_str = normalized_dt.strftime("%Y:%m:%d %H:%M:%S")
@@ -347,14 +370,18 @@ class ImageExifHandler:
 
         width = height = None
         xres = yres = 72
-        try:
-            with Image.open(path) as img:
-                width, height = img.size
-                dpi = img.info.get("dpi")
-                if dpi:
-                    xres, yres = dpi
-        except Exception:
-            pass
+        if image_layout is not None:
+            width, height = image_layout.width, image_layout.height
+            xres, yres = image_layout.x_resolution, image_layout.y_resolution
+        else:
+            try:
+                with Image.open(path) as img:
+                    width, height = img.size
+                    dpi = img.info.get("dpi")
+                    if dpi:
+                        xres, yres = dpi
+            except Exception:
+                pass
 
         return {
             "DateTimeOriginal": dt_str,
@@ -596,7 +623,10 @@ def plan(path: Path, machine_identity: MachineIdentity) -> FilePlan:
     ctime = datetime.datetime.fromtimestamp(st.st_ctime)
     mtime = datetime.datetime.fromtimestamp(st.st_mtime)
     normalized_dt = min(ctime, mtime)
-    plan_fields = handler.build_plan_fields(path, normalized_dt, machine_identity)
+    if isinstance(handler, ImageExifHandler):
+        plan_fields = handler.build_plan_fields(path, normalized_dt, machine_identity, facts.image_layout)
+    else:
+        plan_fields = handler.build_plan_fields(path, normalized_dt, machine_identity)
     return FilePlan(
         path=path,
         format_class=format_class,
@@ -631,28 +661,48 @@ def _log_line(run_options: RunOptions, path: Path, disposition: str, detail: str
     return f"{prefix}{path} | {disposition} | {detail}"
 
 
+def _process_file(path: Path, machine_identity: MachineIdentity, run_options: RunOptions,
+                  file_locks: tuple[Lock, ...]) -> FilePlan:
+    identity = path.stat()
+    with file_locks[hash((identity.st_dev, identity.st_ino)) % len(file_locks)]:
+        file_plan = plan(path, machine_identity)
+        if file_plan.disposition == "stamp" and not run_options.dry_run:
+            apply(file_plan, run_options)
+        return file_plan
+
+
 def run(run_options: RunOptions) -> int:
     machine_identity = resolve_machine_identity()
     log_path = SCRIPT_DIR / LOG_FILENAME
     error_count = 0
     stamped_count = 0
     skipped_count = 0
+    file_locks = tuple(Lock() for _ in range(64))
 
     with open(log_path, "w", encoding="utf-8") as log_file:
-        for path in scan(run_options):
-            try:
-                file_plan = plan(path, machine_identity)
-                if file_plan.disposition == "stamp" and not run_options.dry_run:
-                    apply(file_plan, run_options)
-                log_file.write(_log_line(run_options, path, file_plan.disposition, file_plan.log_detail) + "\n")
-                if file_plan.disposition == "stamp":
-                    stamped_count += 1
-                else:
-                    skipped_count += 1
-            except Exception as exc:  # AD-4: the ONLY per-file catch site
-                error_count += 1
-                reason = f"{type(exc).__name__}: {exc}"
-                log_file.write(_log_line(run_options, path, "error", reason) + "\n")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            paths = iter(scan(run_options))
+            pending = deque()
+            for path in paths:
+                pending.append((path, executor.submit(_process_file, path, machine_identity, run_options, file_locks)))
+                if len(pending) == 4:
+                    break
+            while pending:
+                path, future = pending.popleft()
+                try:
+                    file_plan = future.result()
+                    log_file.write(_log_line(run_options, path, file_plan.disposition, file_plan.log_detail) + "\n")
+                    if file_plan.disposition == "stamp":
+                        stamped_count += 1
+                    else:
+                        skipped_count += 1
+                except Exception as exc:  # AD-4: the ONLY per-file catch site
+                    error_count += 1
+                    reason = f"{type(exc).__name__}: {exc}"
+                    log_file.write(_log_line(run_options, path, "error", reason) + "\n")
+                next_path = next(paths, None)
+                if next_path is not None:
+                    pending.append((next_path, executor.submit(_process_file, next_path, machine_identity, run_options, file_locks)))
 
     stamp_label = "[DRY RUN] Would stamp" if run_options.dry_run else "Stamped"
     print(f"{stamp_label}: {stamped_count} | Skipped: {skipped_count} | Errors: {error_count}")

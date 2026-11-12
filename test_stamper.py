@@ -11,10 +11,11 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from PIL import Image
 import piexif
@@ -110,6 +111,247 @@ class StamperPipelineTests(unittest.TestCase):
         base = dict(target_root=self.tmpdir, recursive=False, dry_run=False, backup=False)
         base.update(overrides)
         return stamper.RunOptions(**base)
+
+    def _distinct_stripe_paths(self, count):
+        paths = []
+        stripes = set()
+        for index in range(1024):
+            path = self.tmpdir / f"file-{index}.png"
+            path.touch()
+            identity = path.stat()
+            stripe = hash((identity.st_dev, identity.st_ino)) % 64
+            if stripe not in stripes:
+                stripes.add(stripe)
+                paths.append(path)
+                if len(paths) == count:
+                    return paths
+        self.fail("could not create files on distinct lock stripes")
+
+    def test_four_workers_overlap_with_bounded_scan_consumption(self):
+        paths = self._distinct_stripe_paths(12)
+        identity = stamper.MachineIdentity("host", "make", "model")
+        coordinator = threading.get_ident()
+        first_batch = threading.Barrier(4, timeout=5)
+        lock = threading.Lock()
+        active = 0
+        peak_active = 0
+        planned = []
+        applied = []
+        consumed = []
+        collected = []
+        original_log_line = stamper._log_line
+
+        def bounded_scan(options):
+            self.assertEqual(threading.get_ident(), coordinator)
+            for index, path in enumerate(paths):
+                if index >= 4:
+                    self.assertIn(paths[index - 4], collected)
+                consumed.append(path)
+                yield path
+
+        def synchronized_plan(path, machine_identity):
+            nonlocal active, peak_active
+            self.assertNotEqual(threading.get_ident(), coordinator)
+            self.assertIs(machine_identity, identity)
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                planned.append(path)
+            if path in paths[:4]:
+                first_batch.wait()
+            return stamper.FilePlan(path, stamper.FormatClass.WRITE_SUPPORT, "stamp", None)
+
+        def tracked_apply(file_plan, options):
+            nonlocal active
+            self.assertNotEqual(threading.get_ident(), coordinator)
+            with lock:
+                self.assertIn(file_plan.path, planned)
+                applied.append(file_plan.path)
+                active -= 1
+            return stamper.ApplyResult("applied")
+
+        def ordered_log(options, path, disposition, detail):
+            self.assertEqual(threading.get_ident(), coordinator)
+            collected.append(path)
+            return original_log_line(options, path, disposition, detail)
+
+        with patch("stamper.scan", side_effect=bounded_scan), \
+             patch("stamper.resolve_machine_identity", return_value=identity) as resolve, \
+             patch("stamper.plan", side_effect=synchronized_plan), \
+             patch("stamper.apply", side_effect=tracked_apply), \
+             patch("stamper._log_line", side_effect=ordered_log), \
+             patch("builtins.print") as output:
+            rc = stamper.run(self._run_options())
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(peak_active, 4)
+        self.assertEqual(active, 0)
+        self.assertEqual(consumed, paths)
+        self.assertEqual(collected, paths)
+        self.assertCountEqual(planned, paths)
+        self.assertCountEqual(applied, paths)
+        resolve.assert_called_once_with()
+        output.assert_called_once_with("Stamped: 12 | Skipped: 0 | Errors: 0")
+
+    def test_out_of_order_worker_errors_are_logged_in_scan_order(self):
+        paths = self._distinct_stripe_paths(5)
+        plan_failed = threading.Event()
+        apply_failed = threading.Event()
+        coordinator = threading.get_ident()
+        completion_order = []
+        applied = []
+        original_log_line = stamper._log_line
+
+        def controlled_plan(path, identity):
+            if path == paths[1]:
+                completion_order.append(path)
+                plan_failed.set()
+                raise ValueError("plan failed")
+            disposition = "skip-protected" if path == paths[3] else "stamp"
+            return stamper.FilePlan(path, stamper.FormatClass.WRITE_SUPPORT, disposition, None)
+
+        def controlled_apply(file_plan, options):
+            path = file_plan.path
+            applied.append(path)
+            if path == paths[2]:
+                completion_order.append(path)
+                apply_failed.set()
+                raise OSError("write failed")
+            if path == paths[0]:
+                self.assertTrue(plan_failed.wait(5), "later planning must run before first apply finishes")
+                self.assertTrue(apply_failed.wait(5), "later apply must run before first apply finishes")
+            completion_order.append(path)
+            return stamper.ApplyResult("applied")
+
+        def checked_log(options, path, disposition, detail):
+            self.assertEqual(threading.get_ident(), coordinator)
+            return original_log_line(options, path, disposition, detail)
+
+        with patch("stamper.scan", return_value=iter(paths)), \
+             patch("stamper.plan", side_effect=controlled_plan), \
+             patch("stamper.apply", side_effect=controlled_apply), \
+             patch("stamper._log_line", side_effect=checked_log), \
+             patch("builtins.print") as output:
+            rc = stamper.run(self._run_options())
+
+        self.assertEqual(rc, 1)
+        lines = (stamper.SCRIPT_DIR / stamper.LOG_FILENAME).read_text().splitlines()
+        self.assertEqual([line.split(" | ")[0] for line in lines], [str(path) for path in paths])
+        self.assertEqual([line.split(" | ")[1] for line in lines],
+                         ["stamp", "error", "error", "skip-protected", "stamp"])
+        self.assertIn("ValueError: plan failed", lines[1])
+        self.assertIn("OSError: write failed", lines[2])
+        self.assertLess(completion_order.index(paths[1]), completion_order.index(paths[0]))
+        self.assertLess(completion_order.index(paths[2]), completion_order.index(paths[0]))
+        self.assertCountEqual(applied, [paths[0], paths[2], paths[4]])
+        output.assert_called_once_with("Stamped: 2 | Skipped: 1 | Errors: 2")
+
+    def test_hardlink_aliases_serialize_plan_backup_and_apply(self):
+        source = self.tmpdir / "source.jpg"
+        alias = self.tmpdir / "alias.jpg"
+        _make_jpeg(source)
+        os.link(source, alias)
+        before = source.read_bytes()
+        contended = threading.Event()
+        applied = threading.Event()
+        planned = []
+        written = []
+        observed_locks = []
+        original_plan = stamper.plan
+        original_apply = stamper.apply
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.guard = threading.Lock()
+                self.attempts = 0
+                self.owner = None
+                observed_locks.append(self)
+
+            def __enter__(self):
+                with self.guard:
+                    self.attempts += 1
+                    if self.attempts == 2:
+                        contended.set()
+                self.lock.acquire()
+                self.owner = threading.get_ident()
+                return self
+
+            def __exit__(self, *exc):
+                self.owner = None
+                self.lock.release()
+
+        def controlled_plan(path, identity):
+            planned.append(path)
+            if len(planned) == 1:
+                self.assertTrue(contended.wait(5), "alias must attempt the same lock during planning")
+            else:
+                self.assertTrue(applied.is_set(), "alias must plan after the preceding apply")
+            return original_plan(path, identity)
+
+        def controlled_apply(file_plan, options):
+            self.assertEqual(len(planned), 1)
+            self.assertEqual(sum(lock.owner == threading.get_ident() for lock in observed_locks), 1)
+            result = original_apply(file_plan, options)
+            self.assertEqual(sum(lock.owner == threading.get_ident() for lock in observed_locks), 1)
+            written.append(file_plan.path)
+            applied.set()
+            return result
+
+        paths = [source, alias]
+        with patch("stamper.scan", side_effect=lambda options: iter(paths)), \
+             patch("stamper.Lock", side_effect=ObservedLock) as locks, \
+             patch("stamper.plan", side_effect=controlled_plan), \
+             patch("stamper.apply", side_effect=controlled_apply), \
+             patch("builtins.print") as output:
+            rc = stamper.run(self._run_options(backup=True))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(locks.call_count, 64)
+        self.assertCountEqual(planned, paths)
+        self.assertEqual(len(written), 1)
+        backups = list(self.tmpdir.glob("*.original"))
+        self.assertEqual(backups, [written[0].with_name(written[0].name + stamper.BACKUP_SUFFIX)])
+        self.assertEqual(backups[0].read_bytes(), before)
+        self.assertTrue(os.path.samefile(source, alias))
+        self.assertIsNotNone(stamper._read_exif_facts(alias).datetime_original)
+        lines = (stamper.SCRIPT_DIR / stamper.LOG_FILENAME).read_text().splitlines()
+        self.assertEqual([line.split(" | ")[0] for line in lines], [str(path) for path in paths])
+        self.assertCountEqual([line.split(" | ")[1] for line in lines], ["stamp", "skip-protected"])
+        output.assert_called_once_with("Stamped: 1 | Skipped: 1 | Errors: 0")
+
+        after = source.read_bytes()
+        with patch("stamper.scan", return_value=iter(paths)), patch("builtins.print") as output:
+            rc = stamper.run(self._run_options(backup=True))
+        self.assertEqual(rc, 0)
+        self.assertEqual(source.read_bytes(), after)
+        self.assertEqual(list(self.tmpdir.glob("*.original")), backups)
+        output.assert_called_once_with("Stamped: 0 | Skipped: 2 | Errors: 0")
+
+    def test_worker_stat_error_is_logged_and_processing_continues(self):
+        missing = self.tmpdir / "missing.jpg"
+        valid = self.tmpdir / "valid.jpg"
+        _make_jpeg(valid)
+        coordinator = threading.get_ident()
+        original_plan = stamper.plan
+
+        def checked_plan(path, identity):
+            self.assertNotEqual(threading.get_ident(), coordinator)
+            return original_plan(path, identity)
+
+        with patch("stamper.scan", return_value=iter([missing, valid])), \
+             patch("stamper.plan", side_effect=checked_plan) as planned, \
+             patch("builtins.print") as output:
+            rc = stamper.run(self._run_options())
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(planned.call_count, 1)
+        self.assertEqual(planned.call_args.args[0], valid)
+        lines = (stamper.SCRIPT_DIR / stamper.LOG_FILENAME).read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn(f"{missing} | error | FileNotFoundError:", lines[0])
+        self.assertIn(f"{valid} | stamp |", lines[1])
+        output.assert_called_once_with("Stamped: 1 | Skipped: 0 | Errors: 1")
 
     def test_completion_summary_counts_mixed_outcomes(self):
         _make_png(self.tmpdir / "stamp.png")
@@ -610,6 +852,140 @@ class ProtectionFactsEdgeCaseTests(unittest.TestCase):
         facts = stamper._read_exif_facts(empty, raise_on_unreadable=False)
         self.assertIsNone(facts.datetime_original)
 
+    def test_layout_failure_does_not_hide_pillow_protection(self):
+        jpg = self.tmpdir / "protected.jpg"
+        _make_jpeg(jpg)
+        for failing_attribute in ("size", "dpi"):
+            with self.subTest(failing_attribute=failing_attribute):
+                image = MagicMock()
+                image.__enter__.return_value = image
+                image.size = (12, 8)
+                image.getexif.return_value.get_ifd.return_value = {
+                    36867: "2020:01:02 03:04:05"
+                }
+                if failing_attribute == "size":
+                    type(image).size = PropertyMock(side_effect=RuntimeError("size unavailable"))
+                else:
+                    image.info.get.side_effect = RuntimeError("dpi unavailable")
+                with patch.object(stamper.Image, "open", return_value=image) as image_open, \
+                     patch.object(stamper.piexif, "load") as fallback:
+                    file_plan = stamper.plan(jpg, stamper.MachineIdentity("host", "make", "model"))
+                self.assertEqual(file_plan.disposition, "skip-protected")
+                self.assertEqual(file_plan.plan_fields, {})
+                image.getexif.assert_called_once_with()
+                image_open.assert_called_once_with(jpg)
+                fallback.assert_not_called()
+
+    def test_piexif_only_protection_never_dispatches_write(self):
+        jpg = self.tmpdir / "protected.jpg"
+        _make_jpeg(jpg)
+        before = jpg.read_bytes()
+        for failure in ("no-date", "exif-parse", "open"):
+            with self.subTest(failure=failure):
+                image = MagicMock()
+                image.__enter__.return_value = image
+                image.size = (12, 8)
+                image.info = {"dpi": (144, 203)}
+                image.getexif.return_value = {}
+                if failure == "exif-parse":
+                    image.getexif.side_effect = ValueError("bad EXIF")
+                with patch.object(stamper.Image, "open", return_value=image) as image_open, \
+                     patch.object(stamper.piexif, "load", return_value={
+                         "Exif": {piexif.ExifIFD.DateTimeDigitized: b"2020:01:02 03:04:05"}
+                     }) as fallback, \
+                     patch.object(stamper, "apply") as write:
+                    if failure == "open":
+                        image_open.side_effect = OSError("initial open failed")
+                    result = stamper.run(stamper.RunOptions(self.tmpdir, False, False, False))
+                self.assertEqual(result, 0)
+                image_open.assert_called_once_with(jpg)
+                fallback.assert_called_once_with(str(jpg))
+                write.assert_not_called()
+                self.assertEqual(jpg.read_bytes(), before)
+
+    def test_exif_parse_failure_retains_first_read_layout(self):
+        png = self.tmpdir / "layout.png"
+        _make_png(png)
+        for fallback_fails in (False, True):
+            with self.subTest(fallback_fails=fallback_fails):
+                image = MagicMock()
+                image.__enter__.return_value = image
+                image.size = (19, 11)
+                image.info = {"dpi": (150.01239999999999, 203.0222)}
+                image.getexif.side_effect = ValueError("bad EXIF")
+                with patch.object(stamper.Image, "open", return_value=image) as image_open, \
+                     patch.object(stamper.piexif, "load", return_value={}) as fallback:
+                    if fallback_fails:
+                        fallback.side_effect = ValueError("unsupported EXIF")
+                    file_plan = stamper.plan(png, stamper.MachineIdentity("host", "make", "model"))
+                image_open.assert_called_once_with(png)
+                fallback.assert_called_once_with(str(png))
+                self.assertEqual(file_plan.disposition, "stamp")
+                self.assertEqual(file_plan.plan_fields["ExifImageWidth"], 19)
+                self.assertEqual(file_plan.plan_fields["ExifImageHeight"], 11)
+                self.assertEqual(file_plan.plan_fields["XResolution"], 150.01239999999999)
+                self.assertEqual(file_plan.plan_fields["YResolution"], 203.0222)
+
+    def test_failed_first_open_or_layout_retries_legacy_read(self):
+        png = self.tmpdir / "retry.png"
+        with Image.new("RGB", (23, 17)) as image:
+            image.save(png, dpi=(144, 203))
+        identity = stamper.MachineIdentity("host", "make", "model")
+        real_open = Image.open
+        for failure in ("open", "size", "dpi"):
+            with self.subTest(failure=failure):
+                first_image = MagicMock()
+                first_image.__enter__.return_value = first_image
+                first_image.size = (23, 17)
+                first_image.getexif.return_value = {}
+                if failure == "size":
+                    type(first_image).size = PropertyMock(side_effect=RuntimeError("size unavailable"))
+                elif failure == "dpi":
+                    first_image.info.get.side_effect = RuntimeError("dpi unavailable")
+                first_result = OSError("initial open failed") if failure == "open" else first_image
+                with real_open(png) as retry_image:
+                    with patch.object(stamper.Image, "open", side_effect=[first_result, retry_image]) as image_open, \
+                         patch.object(stamper.piexif, "load", return_value={}) as fallback:
+                        file_plan = stamper.plan(png, identity)
+                self.assertEqual(image_open.call_count, 2)
+                fallback.assert_called_once_with(str(png))
+                baseline = stamper.ImageExifHandler().build_plan_fields(
+                    png, file_plan.normalized_dt, identity
+                )
+                self.assertEqual(file_plan.plan_fields, baseline)
+
+    def test_failed_layout_retry_preserves_defaults_and_partial_dimensions(self):
+        png = self.tmpdir / "defaults.png"
+        _make_png(png)
+        first_image = MagicMock()
+        first_image.__enter__.return_value = first_image
+        type(first_image).size = PropertyMock(side_effect=RuntimeError("size unavailable"))
+        first_image.getexif.return_value = {}
+        for failure in ("open", "dpi"):
+            with self.subTest(failure=failure):
+                retry_image = MagicMock()
+                retry_image.__enter__.return_value = retry_image
+                retry_image.size = (23, 17)
+                retry_image.info.get.side_effect = RuntimeError("dpi unavailable")
+                retry_result = OSError("retry failed") if failure == "open" else retry_image
+                with patch.object(stamper.Image, "open", side_effect=[first_image, retry_result]), \
+                     patch.object(stamper.piexif, "load", return_value={}):
+                    file_plan = stamper.plan(png, stamper.MachineIdentity("host", "make", "model"))
+                self.assertEqual(file_plan.plan_fields["ExifImageWidth"], None if failure == "open" else 23)
+                self.assertEqual(file_plan.plan_fields["ExifImageHeight"], None if failure == "open" else 17)
+                self.assertEqual(file_plan.plan_fields["XResolution"], 72)
+                self.assertEqual(file_plan.plan_fields["YResolution"], 72)
+
+    def test_unreadable_plan_raises_without_retry_or_write(self):
+        jpg = self.tmpdir / "unreadable.jpg"
+        jpg.write_bytes(b"not a jpeg")
+        with patch.object(stamper.Image, "open", wraps=Image.open) as image_open, \
+             patch.object(stamper, "apply") as write:
+            with self.assertRaisesRegex(RuntimeError, "unreadable/corrupt file"):
+                stamper.plan(jpg, stamper.MachineIdentity("host", "make", "model"))
+        image_open.assert_called_once_with(jpg)
+        write.assert_not_called()
+
 
 class DateTimeLogicTests(unittest.TestCase):
     """Test date/time logic in planning."""
@@ -620,6 +996,39 @@ class DateTimeLogicTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_plan_reuses_layout_with_one_pillow_open(self):
+        for extension in (".jpg", ".png", ".tiff", ".webp", ".heic"):
+            with self.subTest(extension=extension):
+                image_path = self.tmpdir / ("layout" + extension)
+                with Image.new("RGB", (12, 8)) as image:
+                    image.save(image_path)
+                with patch.object(stamper.Image, "open", wraps=Image.open) as image_open:
+                    file_plan = stamper.plan(image_path, self.identity)
+                self.assertEqual(image_open.call_count, 1)
+                self.assertEqual(file_plan.disposition, "stamp")
+                self.assertEqual(file_plan.plan_fields["ExifImageWidth"], 12)
+                self.assertEqual(file_plan.plan_fields["ExifImageHeight"], 8)
+
+    def test_reused_layout_matches_legacy_read_for_all_fields(self):
+        handler = stamper.ImageExifHandler()
+        for extension in (".jpg", ".png", ".tiff", ".webp", ".heic"):
+            for dpi in (None, (150, 203)):
+                with self.subTest(extension=extension, dpi=dpi):
+                    image_path = self.tmpdir / ("metadata" + extension)
+                    with Image.new("RGB", (19, 11)) as image:
+                        image.save(image_path, **({"dpi": dpi} if dpi else {}))
+                    file_plan = stamper.plan(image_path, self.identity)
+                    baseline = handler.build_plan_fields(
+                        image_path, file_plan.normalized_dt, self.identity
+                    )
+                    self.assertEqual(file_plan.plan_fields, baseline)
+                    with Image.open(image_path) as image:
+                        expected_dpi = image.info.get("dpi") or (72, 72)
+                    self.assertEqual(file_plan.plan_fields["XResolution"], expected_dpi[0])
+                    self.assertEqual(file_plan.plan_fields["YResolution"], expected_dpi[1])
+                    if extension == ".png" and dpi:
+                        self.assertEqual(file_plan.plan_fields["XResolution"], 150.01239999999999)
 
     def test_plan_unprotected_file_gets_normalized_datetime(self):
         png = self.tmpdir / "test.png"
@@ -690,6 +1099,48 @@ class StampedMetadataValidationTests(unittest.TestCase):
         base = dict(target_root=self.tmpdir, recursive=False, dry_run=False, backup=False)
         base.update(overrides)
         return stamper.RunOptions(**base)
+
+    def test_concurrent_images_keep_distinct_layout_and_resolution(self):
+        identity = stamper.MachineIdentity("host", "make", "model")
+        expected = {}
+        for index in range(8):
+            image_path = self.tmpdir / f"layout-{index}.png"
+            with Image.new("RGB", (12 + index, 21 + index)) as image:
+                image.save(image_path, dpi=(100 + index * 13, 150 + index * 17))
+            timestamp = min(image_path.stat().st_ctime, image_path.stat().st_mtime)
+            expected[image_path] = stamper.ImageExifHandler().build_plan_fields(
+                image_path, datetime.datetime.fromtimestamp(timestamp), identity
+            )
+        barrier = threading.Barrier(4)
+        handler = stamper.HANDLERS["image"]
+        original_read = handler.read_protection_facts
+
+        def synchronized_read(path):
+            facts = original_read(path)
+            barrier.wait(timeout=10)
+            return facts
+
+        with patch.object(handler, "read_protection_facts", side_effect=synchronized_read):
+            with stamper.ThreadPoolExecutor(max_workers=4) as executor:
+                plans = list(executor.map(lambda path: stamper.plan(path, identity), expected))
+        for file_plan in plans:
+            self.assertEqual(file_plan.plan_fields, expected[file_plan.path])
+        with patch.object(stamper, "resolve_machine_identity", return_value=identity), \
+             patch.object(stamper, "apply", wraps=stamper.apply) as write:
+            result = stamper.run(self._run_options())
+        self.assertEqual(result, 0)
+        self.assertEqual(write.call_count, len(expected))
+        for call in write.call_args_list:
+            file_plan = call.args[0]
+            fields = expected[file_plan.path]
+            self.assertEqual(file_plan.plan_fields, fields)
+            with Image.open(file_plan.path) as image:
+                exif = image.getexif()
+                exif_ifd = exif.get_ifd(stamper.IFD.Exif)
+                self.assertEqual(exif_ifd[piexif.ExifIFD.PixelXDimension], fields["ExifImageWidth"])
+                self.assertEqual(exif_ifd[piexif.ExifIFD.PixelYDimension], fields["ExifImageHeight"])
+                self.assertEqual(exif[piexif.ImageIFD.XResolution], int(fields["XResolution"]))
+                self.assertEqual(exif[piexif.ImageIFD.YResolution], int(fields["YResolution"]))
 
     def test_stamped_jpeg_has_required_fields(self):
         jpg = self.tmpdir / "test.jpg"

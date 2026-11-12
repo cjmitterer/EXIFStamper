@@ -75,6 +75,7 @@ python stamper.py <directory> [--recursive] [--dry-run] [--backup]
 
 ## Key behaviors
 
+- **Automatic four-file parallelism** processes up to four files at once with bounded pending work; logs remain in scan order
 - **Never overwrites existing dates** only fills in missing timestamps
 - **Never modifies camera hardware fields** aperture, ISO, shutter speed, focal length, lens
 - **RAW/DNG files are inspect-only** never written to
