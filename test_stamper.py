@@ -6,9 +6,11 @@ Run with: python test_stamper.py
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -98,6 +100,42 @@ def _make_webp(path: Path) -> None:
 def _make_tiff(path: Path) -> None:
     img = Image.new("RGB", (8, 8), color=(255, 255, 0))
     img.save(path, format="TIFF")
+
+
+class GifXmpTests(unittest.TestCase):
+    @patch("stamper.subprocess.run")
+    def test_protection_and_read_errors(self, execute):
+        path = Path("fixture.GIF")
+        self.assertEqual(stamper.classify(path)[0], stamper.FormatClass.WRITE_SUPPORT)
+        for tag in ("DateTimeOriginal", "CreateDate"):
+            execute.return_value.stdout = json.dumps([{tag: "existing date"}])
+            self.assertEqual(stamper.plan(path, None).disposition, "skip-protected")
+        for output in ("[]", "invalid JSON", '[{"Error": "bad file"}]'):
+            execute.return_value.stdout = output
+            with self.assertRaises((RuntimeError, ValueError)):
+                stamper.HANDLERS["gif"].read_protection_facts(path)
+
+    @patch("stamper.subprocess.run")
+    def test_plan_and_write_xmp_dates(self, execute):
+        handler = stamper.HANDLERS["gif"]
+        path = Path("fixture.gif")
+        execute.return_value.stdout = '[{}]'
+        self.assertEqual(handler.read_protection_facts(path), stamper.ProtectionFacts(None, None))
+        with patch("stamper._format_utc_offset", return_value="-04:00"):
+            fields = handler.build_plan_fields(path, datetime.datetime(2019, 7, 8, 9, 10, 11), None)
+        self.assertEqual(set(fields), {"XMP-exif:DateTimeOriginal", "XMP-xmp:CreateDate", "XMP-xmp:ModifyDate"})
+        self.assertEqual(set(fields.values()), {"2019:07:08 09:10:11-04:00"})
+        execute.return_value.stdout = "1 image files updated\n"
+        self.assertEqual(handler.apply(path, fields), stamper.ApplyResult("applied", fields))
+        self.assertTrue(execute.call_args.kwargs["check"])
+        for tag, value in fields.items():
+            self.assertIn(f"-{tag}={value}", execute.call_args.args[0])
+        execute.return_value.stdout = "0 image files updated"
+        with self.assertRaises(RuntimeError):
+            handler.apply(path, fields)
+        execute.side_effect = subprocess.CalledProcessError(1, "exiftool")
+        with self.assertRaises(subprocess.CalledProcessError):
+            handler.read_protection_facts(path)
 
 
 class StamperPipelineTests(unittest.TestCase):

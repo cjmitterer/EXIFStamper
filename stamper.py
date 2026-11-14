@@ -9,7 +9,7 @@ Usage:
 
 This slice implements the full pipeline with real write support for
 JPEG/TIFF/WebP/PNG/HEIC (via piexif+Pillow+pillow-heif), MP4/M4V (via mutagen),
-and MOV (via exiftool). DNG and RAW formats (CR2/NEF/ARW/ORF/RW2) remain wired
+and MOV/GIF (via exiftool). DNG and RAW formats (CR2/NEF/ARW/ORF/RW2) remain wired
 into FORMAT_CAPABILITIES as detect-only (AD-8 default) pending their own promotion.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import shutil
 import socket
@@ -95,7 +96,7 @@ def _find_exiftool_executable() -> str:
                     pass
     
     raise RuntimeError(
-        "exiftool not found on system. Required for MOV/video file support. "
+        "exiftool not found on system. Required for MOV/video and GIF support. "
         "Download from https://exiftool.org/ and add to PATH, or install to a common location."
     )
 
@@ -138,6 +139,7 @@ FORMAT_CAPABILITIES: Dict[str, tuple] = {
     ".tiff": (FormatClass.WRITE_SUPPORT, "image"),
     ".webp": (FormatClass.WRITE_SUPPORT, "image"),
     ".png": (FormatClass.WRITE_SUPPORT, "image"),
+    ".gif": (FormatClass.WRITE_SUPPORT, "gif"),
     ".heic": (FormatClass.WRITE_SUPPORT, "image"),  # promoted, AD-8
     ".dng": (FormatClass.DETECT_ONLY, "detect_only"),  # gated, AD-8
     ".mp4": (FormatClass.WRITE_SUPPORT, "video"),  # promoted, AD-8
@@ -424,6 +426,40 @@ class ImageExifHandler:
         return ApplyResult(status="applied", written_fields=dict(plan_fields))
 
 
+class GifXmpHandler:
+    format_class = FormatClass.WRITE_SUPPORT
+
+    def read_protection_facts(self, path: Path) -> ProtectionFacts:
+        result = subprocess.run(
+            [EXIFTOOL_PATH, "-json", "-DateTimeOriginal", "-CreateDate", "-Error", str(path)],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        records = json.loads(result.stdout)
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            raise RuntimeError(f"invalid GIF metadata record: {path}")
+        record = records[0]
+        if "Error" in record:
+            raise RuntimeError(f"exiftool reported a GIF file error: {path}")
+        return ProtectionFacts(record.get("DateTimeOriginal"), record.get("CreateDate"))
+
+    def build_plan_fields(self, path, normalized_dt, machine_identity):
+        assert normalized_dt is not None
+        date = normalized_dt.strftime("%Y:%m:%d %H:%M:%S") + _format_utc_offset(normalized_dt)
+        return dict.fromkeys(
+            ("XMP-exif:DateTimeOriginal", "XMP-xmp:CreateDate", "XMP-xmp:ModifyDate"), date
+        )
+
+    def apply(self, path: Path, plan_fields: Dict[str, Any]) -> ApplyResult:
+        result = subprocess.run(
+            [EXIFTOOL_PATH, "-overwrite_original",
+             *[f"-{tag}={value}" for tag, value in plan_fields.items()], str(path)],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        if result.stdout.strip() != "1 image files updated":
+            raise RuntimeError(f"exiftool did not confirm a GIF metadata update: {path}")
+        return ApplyResult(status="applied", written_fields=dict(plan_fields))
+
+
 class DetectOnlyHandler:
     """RAW (CR2/NEF/ARW/ORF/RW2) plus DNG pending promotion (AD-8).
     apply() must never be called (AD-3)."""
@@ -540,6 +576,7 @@ class VideoAtomHandler:
 
 HANDLERS = {
     "image": ImageExifHandler(),
+    "gif": GifXmpHandler(),
     "detect_only": DetectOnlyHandler(),
     "video": VideoAtomHandler(),
 }

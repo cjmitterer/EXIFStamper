@@ -17,7 +17,8 @@ Windows CLI. Single script: `stamper.py`.
 3. For unprotected files, stamps them with `min(creation time, modified time)` 
 4. Logs results to `stamper.log` and prints stamped, skipped, and error totals when finished
 
-Stamped metadata includes: date, time, timezone, device info (Make/Model), and software name.
+Image EXIF metadata includes date, time, timezone, device info (Make/Model), and software name.
+GIFs receive only embedded XMP dates, not camera/device fields.
 
 Skipped totals include protected, detect-only, and unsupported files. Errors are counted separately. Dry runs report "Would stamp" instead of "Stamped".
 
@@ -26,6 +27,7 @@ Skipped totals include protected, detect-only, and unsupported files. Errors are
 | Format | Support | Notes |
 |---|---|---|
 | JPEG, JPG, PNG, TIFF, WebP, HEIC | Full support | EXIF metadata |
+| GIF (static and animated) | Full support | Embedded XMP dates (ExifTool), no re-encoding |
 | MP4, M4V | Full support | Container atoms (mutagen) |
 | MOV | Full support | Container atoms (exiftool) |
 | CR2, NEF, ARW, ORF, RW2, DNG | Detect-only | Inspected but never written |
@@ -35,7 +37,7 @@ Skipped totals include protected, detect-only, and unsupported files. Errors are
 
 **Requirements:**
 - Python 3.12+
-- `exiftool` executable (required for MOV files)
+- `exiftool` executable (already required at startup; used for MOV and GIF files)
 
 **Install Python packages:**
 ```bash
@@ -80,3 +82,10 @@ python stamper.py <directory> [--recursive] [--dry-run] [--backup]
 - **Never modifies camera hardware fields** aperture, ISO, shutter speed, focal length, lens
 - **RAW/DNG files are inspect-only** never written to
 - **Each run overwrites `stamper.log`** keep a copy if you need a history
+
+## GIF Dates And Compatibility
+
+GIFs receive XMP `DateTimeOriginal`, `CreateDate`, and `ModifyDate` with timezone,
+without re-encoding animation. Existing dates are never overwritten.
+AgeSorter and SadderPhotos already read these dates; no reader changes are needed.
+Other viewers may ignore GIF XMP metadata.
